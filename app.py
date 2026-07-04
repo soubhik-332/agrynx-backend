@@ -34,8 +34,10 @@ from datetime import datetime, timedelta
 
 import requests
 from flask import Flask, jsonify, render_template, request
+from flask_cors import CORS
 
 app = Flask(__name__, template_folder=os.path.dirname(os.path.abspath(__file__)))
+CORS(app)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6JvikSAG0KPzDpYH5DpkfAofIgv3ocOX6DFRaSaVKcSiA")
 GEMINI_MODEL = "gemini-2.5-flash"
