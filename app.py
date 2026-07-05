@@ -39,11 +39,11 @@ from flask_cors import CORS
 app = Flask(__name__, template_folder=os.path.dirname(os.path.abspath(__file__)))
 CORS(app)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6IswnC1tlZEXziihNjNHMr7Q0v-AHFBHuNyaOD0kLarnw")
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_API_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-)
+# Groq – free tier, keys never expire. Get yours at https://console.groq.com
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
+GROQ_TEXT_MODEL  = "llama-3.3-70b-versatile"       # for text Q&A
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"  # for image diagnosis
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # data.gov.in resource id for the "Variety-wise Daily Market Prices Data of
 # Commodities" dataset (published by the Ministry of Agriculture / Agmarknet).
@@ -67,11 +67,10 @@ def index():
 @app.route("/api/analyze", methods=["POST"])
 def analyze():
     """
-    Proxy crop questions to the Google Gemini API (free tier). Works two ways:
+    Proxy crop questions to the Groq API (free, unlimited). Works two ways:
 
-    1. WITH a photo — full crop diagnosis (disease/pest identification).
-    2. WITHOUT a photo — plain text farming Q&A (e.g. "how do I make a
-       natural fertiliser at home?", "when should I sow wheat?", etc).
+    1. WITH a photo — full crop diagnosis using llama-4-scout vision model.
+    2. WITHOUT a photo — plain text farming Q&A using llama-3.3-70b.
 
     Expects JSON body:
         {
@@ -87,11 +86,11 @@ def analyze():
     or on error:
         { "error": "<message>" }
     """
-    if not GEMINI_API_KEY:
+    if not GROQ_API_KEY:
         return jsonify({
-            "error": "Server is not configured with a GEMINI_API_KEY. "
-                     "Get a free key at https://aistudio.google.com/apikey, "
-                     "set the environment variable, and restart the server."
+            "error": "Server is not configured with a GROQ_API_KEY. "
+                     "Get a free key at https://console.groq.com, "
+                     "set the GROQ_API_KEY environment variable, and restart."
         }), 500
 
     data = request.get_json(silent=True) or {}
@@ -99,15 +98,14 @@ def analyze():
     question = data.get("question", "")
     image_base64 = data.get("image_base64", "")
     image_mime = data.get("image_mime", "image/jpeg")
-    history = data.get("history", [])
+    history = data.get("history", [])  # Gemini-format history from frontend
     has_image = bool(image_base64)
 
     if not question:
         return jsonify({"error": "A question is required."}), 400
 
-    # Gemini sometimes drifts from a strict bracket-tag format unless told very
-    # explicitly. Reinforce it here (in addition to whatever the frontend sent)
-    # so the app's parser has the best chance of finding the expected tags.
+    # Build strict format instructions so the tag-based parser in the frontend
+    # reliably finds every section.
     if has_image:
         format_reminder = (
             "\n\nFORMAT RULES (follow exactly, no exceptions):\n"
@@ -117,8 +115,7 @@ def analyze():
             "- Every section must contain highly detailed, comprehensive, and complete explanations. "
             "Never write short, brief, or single-word summaries. Provide exhaustive step-by-step guidance.\n"
             "- Use plain [TAG]...[/TAG] syntax exactly as shown, with the exact tag "
-            "names given, on their own or inline — do not rename, translate, or "
-            "reformat the tag names themselves.\n"
+            "names given — do not rename, translate, or reformat the tag names.\n"
             "- Every one of these six tags must appear exactly once:\n"
             "[DIAGNOSIS]title|severity(High/Medium/Low)|confidence%[/DIAGNOSIS]\n"
             "[WHAT_IS_HAPPENING]...[/WHAT_IS_HAPPENING]\n"
@@ -140,53 +137,73 @@ def analyze():
             "as given (content itself can be in the farmer's language)."
         )
 
-    parts = [{"text": question}]
+    # Convert Gemini-format history to OpenAI/Groq format
+    # Gemini: {role: 'user'|'model', parts: [{text}]}  →  OpenAI: {role: 'user'|'assistant', content}
+    openai_history = []
+    for h in history:
+        role = "assistant" if h.get("role") == "model" else "user"
+        parts = h.get("parts", [])
+        content = " ".join(p.get("text", "") for p in parts if "text" in p)
+        if content:
+            openai_history.append({"role": role, "content": content})
+
+    # Build the user message — text only, or text + image for vision
     if has_image:
-        parts.append({"inline_data": {"mime_type": image_mime, "data": image_base64}})
+        user_content = [
+            {"type": "text", "text": question},
+            {"type": "image_url", "image_url": {
+                "url": f"data:{image_mime};base64,{image_base64}"
+            }},
+        ]
+        model = GROQ_VISION_MODEL
+    else:
+        user_content = question
+        model = GROQ_TEXT_MODEL
 
-    contents = history.copy()
-    contents.append({"role": "user", "parts": parts})
-
-    payload = {
-        "system_instruction": {"parts": [{"text": system_prompt + format_reminder}]},
-        "contents": contents,
-        "generationConfig": {"maxOutputTokens": 2000, "temperature": 0.4},
-    }
+    messages = [
+        {"role": "system", "content": system_prompt + format_reminder},
+        *openai_history,
+        {"role": "user", "content": user_content},
+    ]
 
     try:
         resp = requests.post(
-            GEMINI_API_URL,
-            params={"key": GEMINI_API_KEY},
-            json=payload,
+            GROQ_API_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json={
+                "model": model,
+                "messages": messages,
+                "max_tokens": 2048,
+                "temperature": 0.4,
+            },
             timeout=60,
         )
         resp.raise_for_status()
-        result = resp.json()
-        candidates = result.get("candidates", [])
-        resp_parts = candidates[0]["content"]["parts"] if candidates else []
-        text = resp_parts[0].get("text", "") if resp_parts else ""
+        text = resp.json()["choices"][0]["message"]["content"].strip()
+
         if not text:
             return jsonify({"error": "Empty response from the AI model."}), 502
-            
-        # Fallback handling if Gemini missed tags entirely
+
+        # Fallback: wrap bare text in tags if the model forgot
         if has_image and "[DIAGNOSIS]" not in text.upper():
             text = (
                 "[DIAGNOSIS]Crop Health Assessment|Medium|—[/DIAGNOSIS]\n"
-                f"[WHAT_IS_HAPPENING]{text.strip()}[/WHAT_IS_HAPPENING]"
+                f"[WHAT_IS_HAPPENING]{text}[/WHAT_IS_HAPPENING]"
             )
         elif not has_image and not any(tag in text.upper() for tag in ["[ANSWER]", "[FARM_PLAN]", "[MARKET_ADVICE]"]):
-            text = f"[ANSWER]{text.strip()}[/ANSWER]"
-            
+            text = f"[ANSWER]{text}[/ANSWER]"
+
         return jsonify({"text": text})
+
     except requests.exceptions.HTTPError:
         detail = ""
         try:
             detail = resp.json().get("error", {}).get("message", resp.text)
         except Exception:
             detail = resp.text
-        return jsonify({"error": f"Gemini API error: {detail}"}), resp.status_code
+        return jsonify({"error": f"AI API error: {detail}"}), resp.status_code
     except requests.exceptions.RequestException as exc:
-        return jsonify({"error": f"Network error contacting Gemini API: {exc}"}), 502
+        return jsonify({"error": f"Network error contacting AI: {exc}"}), 502
 
 
 @app.route("/api/geocode")
