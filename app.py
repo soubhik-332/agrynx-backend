@@ -228,10 +228,9 @@ def geocode():
 @app.route("/api/weather")
 def weather():
     """
-    Fetch current + 3-day weather forecast from wttr.in for the given
-    lat/lon. Passes through wttr.in's raw JSON shape unchanged, since the
-    frontend already knows how to parse it (current_condition[0],
-    weather[].hourly[4], etc.)
+    Fetch current + 3-day weather forecast from Open-Meteo (free, no key).
+    Transforms the response into the wttr.in-compatible shape the frontend
+    already knows how to parse (current_condition[0], weather[].hourly[4]).
 
     Query params: lat, lon
     """
@@ -240,12 +239,77 @@ def weather():
     if not lat or not lon:
         return jsonify({"error": "lat and lon query parameters are required."}), 400
 
+    # WMO weather code → human description
+    WMO_DESC = {
+        0: "Sunny", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+        45: "Fog", 48: "Icy fog",
+        51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle",
+        61: "Light rain", 63: "Rain", 65: "Heavy rain",
+        71: "Light snow", 73: "Snow", 75: "Heavy snow",
+        77: "Snow grains",
+        80: "Rain showers", 81: "Heavy showers", 82: "Violent showers",
+        85: "Snow showers", 86: "Heavy snow showers",
+        95: "Thunderstorm", 96: "Thunderstorm with hail", 99: "Heavy thunderstorm",
+    }
+
+    def wmo_desc(code):
+        return WMO_DESC.get(int(code), "Partly cloudy")
+
     try:
-        resp = requests.get(f"https://wttr.in/{lat},{lon}", params={"format": "j1"}, timeout=15)
+        resp = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,"
+                           "weather_code,wind_speed_10m",
+                "daily": "temperature_2m_max,temperature_2m_min,weather_code,precipitation_sum",
+                "timezone": "auto",
+                "forecast_days": 3,
+            },
+            timeout=15,
+        )
         resp.raise_for_status()
-        return jsonify(resp.json())
+        d = resp.json()
+
+        cur = d.get("current", {})
+        daily = d.get("daily", {})
+
+        # Build wttr.in-compatible current_condition block
+        current_condition = [{
+            "temp_C": str(round(cur.get("temperature_2m", 0))),
+            "FeelsLikeC": str(round(cur.get("apparent_temperature", 0))),
+            "humidity": str(round(cur.get("relative_humidity_2m", 0))),
+            "weatherDesc": [{"value": wmo_desc(cur.get("weather_code", 0))}],
+            "windspeedKmph": str(round(cur.get("wind_speed_10m", 0))),
+        }]
+
+        # Build wttr.in-compatible weather[] block (one entry per forecast day)
+        times = daily.get("time", [])
+        maxtemps = daily.get("temperature_2m_max", [])
+        mintemps = daily.get("temperature_2m_min", [])
+        codes = daily.get("weather_code", [])
+        precips = daily.get("precipitation_sum", [])
+
+        weather_days = []
+        for i, date in enumerate(times):
+            rain_mm = precips[i] if i < len(precips) else 0
+            desc = wmo_desc(codes[i] if i < len(codes) else 0)
+            # Simulate 8 hourly slots; slot[4] carries the day description & rain
+            hourly = [{"precipMM": "0", "weatherDesc": [{"value": desc}]} for _ in range(8)]
+            hourly[4]["precipMM"] = str(round(rain_mm, 1))
+            weather_days.append({
+                "date": date,
+                "maxtempC": str(round(maxtemps[i])) if i < len(maxtemps) else "0",
+                "mintempC": str(round(mintemps[i])) if i < len(mintemps) else "0",
+                "hourly": hourly,
+            })
+
+        return jsonify({"current_condition": current_condition, "weather": weather_days})
+
     except requests.exceptions.RequestException as exc:
         return jsonify({"error": f"Weather service unavailable: {exc}"}), 502
+
 
 
 # Base/reference modal prices (₹ per quintal) used to generate believable
